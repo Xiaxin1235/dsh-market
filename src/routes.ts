@@ -42,7 +42,7 @@ import { applyPreset, deletePreset, listPresets, previewPreset, savePreset } fro
 import { createProfileSnapshot, DEFAULT_MAX_SNAPSHOTS, deleteSnapshot, listSnapshots, restoreSnapshot } from './snapshot.ts'
 import { readHostRecoveryView, restoreHostRecoveryBackup } from './host-recovery.ts'
 import { trialValidate } from './trial.ts'
-import { catalogRepoKey, findCatalogEntryForLocal, findInstalledAlias, gitCommitOfTarget, githubCommitOfTarget, githubTargetAtCommit, gitAllowBuildsKey, gitRefOfTarget, gitTargetAtCommit, gitUpdateTarget, hostedRepoKey, lookupRepoFromUrl, pinnedAllowBuildsKeys, installTargetFor, isGenerationLink, isLocalSpec, NPM_NAME_RE, repoOfTarget, restoreBlockedByWorkspace, restoreTargetForLocal, sourceFallbackFor, workspaceProtocolDeps } from './sources.ts'
+import { catalogRepoKey, findCatalogEntryForLocal, findInstalledAlias, gitCommitOfTarget, githubCommitOfTarget, githubTargetAtCommit, gitAllowBuildsKey, gitRefOfTarget, gitTargetAtCommit, gitUpdateTarget, hostedRepoKey, lookupRepoFromUrl, pinnedAllowBuildsKeys, installTargetFor, isGenerationLink, isLocalSpec, NPM_NAME_RE, parseSourceUrl, repoOfTarget, restoreBlockedByWorkspace, restoreTargetForLocal, sourceFallbackFor, workspaceProtocolDeps } from './sources.ts'
 import { failureDetail, groupConflictsByOwner, installApplied, isHostPortCollision, isStaleUpdate, parseIgnoredBuildEntries, parseIgnoredBuilds, parsePrepareKey, parsePrepareNotAllowed, pnpmBlockedByOpenFiles, pnpmNeverStarted, pnpmRefusedYoungRelease, RELEASE_AGE_OVERRIDE, removeDanglingHostBridge, retargetCollections, updateApplied, validateAddedPlugins, withHoistRecovery } from './install.ts'
 import { classifyPnpmFailure } from './pnpm-compat.ts'
 import { asChannel, CHANNELS, DIST_TAG, resolveChannel, type Channel } from './channels.ts'
@@ -530,6 +530,9 @@ export function mountMarketRoutes(
   const persistentLogFile = join(activeProfileDir, '.dsh-market', 'log.ndjson')
   const discoveryManifests = new DiscoveryManifestIndex(
     join(activeProfileDir, '.dsh-market', 'discovery-compatibility-v1.json'),
+  )
+  const githubDiscoveryManifests = new DiscoveryManifestIndex(
+    join(activeProfileDir, '.dsh-market', 'discovery-github-compatibility-v1.json'),
   )
   configurePersistentLog(persistentLogFile)
   let agentGuardUnavailableLogged = false
@@ -2730,13 +2733,30 @@ export function mountMarketRoutes(
           sendJson(response, 400, { error: 'packages must be an array of at most 64 npm package names' })
           return
         }
+        const requestedEntries = (body as { entries?: unknown }).entries ?? []
+        if (!Array.isArray(requestedEntries) || requestedEntries.length + requested.length > 64
+          || !requestedEntries.every(url => typeof url === 'string' && parseSourceUrl(url) !== null)) {
+          sendJson(response, 400, { error: 'entries must be GitHub catalog URLs; at most 64 packages and entries per batch' })
+          return
+        }
         const packages = [...new Set(requested as string[])]
         try {
+          const urls = new Set(requestedEntries as string[])
+          const entries = urls.size === 0 ? [] : (await loadRegistry()).plugins.filter(entry =>
+            urls.has(entry.url) && (entry.npm == null || entry.npm === ''))
+          if (new Set(entries.map(entry => entry.url)).size !== urls.size) {
+            sendJson(response, 400, { error: 'entries must name GitHub-only plugins in the current catalog' })
+            return
+          }
           const host = dshHostInfo()
           const hostVersion = host?.version ?? null
           const hostPackages = corePackageNames(host?.directory ?? null)
-          const facts = await discoveryManifests.lookup(packages, routesFor(region).npmRegistry)
-          const plugins = Object.fromEntries(packages.map(name => [
+          const [npmFacts, githubFacts] = await Promise.all([
+            discoveryManifests.lookup(packages, routesFor(region).npmRegistry),
+            githubDiscoveryManifests.lookupGitHub(entries),
+          ])
+          const facts = { ...npmFacts, ...githubFacts }
+          const plugins = Object.fromEntries([...packages, ...urls].map(name => [
             name,
             deriveHostCompatibility(facts[name] ?? null, hostVersion, hostPackages),
           ]))
